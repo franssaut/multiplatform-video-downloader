@@ -63,6 +63,8 @@ export const VideoPreviewModal: React.FC<VideoPreviewModalProps> = ({
               title={title}
               allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
               allowFullScreen
+              sandbox="allow-scripts allow-same-origin allow-presentation"
+              referrerPolicy="strict-origin-when-cross-origin"
               className="w-full h-full border-0"
             />
           ) : videoError || !videoUrl ? (

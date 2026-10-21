@@ -1,9 +1,16 @@
 import os
 import sys
 import json
+import re
+import time
+import uuid
+import socket
+import ipaddress
 import tempfile
+import threading
 import urllib.parse
 import subprocess
+from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Ensure ffmpeg and ffprobe are in PATH
@@ -16,10 +23,81 @@ except Exception as e:
 import yt_dlp
 
 PORT = 5000
-DOWNLOAD_DIR = os.path.join(tempfile.gettempdir(), 'downloader_cache')
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+MAX_URL_LENGTH = 2048
+MAX_DURATION_SECONDS = 14400  # 4 hours max
+MAX_FILESIZE_BYTES = 750 * 1024 * 1024  # 750 MB max
 
-def get_stream_codecs(file_path):
+# Thread-safe in-memory rate limiter
+class RateLimiter:
+    def __init__(self, max_requests: int, window_seconds: int):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests = defaultdict(list)
+        self.lock = threading.Lock()
+
+    def is_allowed(self, client_ip: str) -> bool:
+        now = time.time()
+        with self.lock:
+            cutoff = now - self.window_seconds
+            timestamps = [t for t in self.requests[client_ip] if t > cutoff]
+            if len(timestamps) >= self.max_requests:
+                self.requests[client_ip] = timestamps
+                return False
+            timestamps.append(now)
+            self.requests[client_ip] = timestamps
+            return True
+
+info_limiter = RateLimiter(max_requests=40, window_seconds=60)      # 40 info queries / min
+download_limiter = RateLimiter(max_requests=10, window_seconds=60)  # 10 downloads / min
+
+def validate_and_sanitize_url(url_str: str):
+    """
+    Strict URL validation to defend against SSRF (Server-Side Request Forgery).
+    Blocks private IP addresses, loopback, link-local, and unauthorized protocols.
+    """
+    if not url_str or len(url_str) > MAX_URL_LENGTH:
+        return False, 'Panjang URL melebihi batas yang diizinkan (maksimal 2048 karakter).'
+
+    clean = url_str.strip()
+    try:
+        parsed = urllib.parse.urlparse(clean)
+    except Exception:
+        return False, 'Format URL tidak valid.'
+
+    if parsed.scheme.lower() not in ('http', 'https'):
+        return False, 'Hanya protokol HTTP dan HTTPS yang diizinkan.'
+
+    hostname = parsed.hostname
+    if not hostname:
+        return False, 'Alamat domain/hostname tidak valid.'
+
+    hostname_lower = hostname.lower()
+    if hostname_lower in ('localhost', '127.0.0.1', '::1', '0.0.0.0'):
+        return False, 'Akses ke loopback / localhost dilarang.'
+
+    # DNS Resolution check against private & reserved IP ranges
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
+        for _, _, _, _, sockaddr in addr_info:
+            ip_str = sockaddr[0]
+            ip = ipaddress.ip_address(ip_str)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return False, f'Akses ke alamat IP privat ({ip_str}) dilarang demi keamanan sistem.'
+    except socket.gaierror:
+        return False, 'Domain tidak dapat ditemukan atau tidak terdaftar di DNS.'
+    except Exception as e:
+        return False, f'Validasi keamanan domain gagal: {str(e)[:60]}'
+
+    return True, clean
+
+def sanitize_filename(name: str, fallback: str = "media", max_len: int = 50) -> str:
+    """Sanitize filename to prevent header injection (CRLF) and directory traversal."""
+    # Strip any control chars, newlines, quotes, colons, slashes
+    clean = re.sub(r'[\r\n\t\x00-\x1f"\\/<>:|?*]', '', name).strip()
+    clean = re.sub(r'\s+', '_', clean)
+    return clean[:max_len] if clean else fallback
+
+def get_stream_codecs(file_path: str):
     """Inspect file to find video and audio codec names using ffprobe."""
     try:
         cmd = [
@@ -37,22 +115,19 @@ def get_stream_codecs(file_path):
         print(f"ffprobe error: {e}")
     return None, None
 
-def convert_to_universal_mp4(input_file, output_file):
+def convert_to_universal_mp4(input_file: str, output_file: str):
     """
     Ensure the MP4 file uses H.264 (AVC) video and AAC audio with +faststart.
-    This guarantees 100% compatibility with Windows Media Player, iOS, Mac, and Android.
+    Guarantees 100% compatibility with Windows Media Player, iOS, Mac, and Android.
     """
     v_codec, a_codec = get_stream_codecs(input_file)
-    print(f"Detected input codecs: video={v_codec}, audio={a_codec}")
 
     # If already H.264 and AAC, fast stream copy!
     if v_codec in ('h264', 'avc1') and a_codec in ('aac', 'mp4a'):
         v_args = ['-c:v', 'copy']
         a_args = ['-c:a', 'copy']
     else:
-        # Re-encode video if it's VP9, AV1, etc.
         v_args = ['-c:v', 'copy'] if v_codec in ('h264', 'avc1') else ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22', '-pix_fmt', 'yuv420p']
-        # Re-encode audio if it's Opus, Vorbis, etc.
         a_args = ['-c:a', 'copy'] if a_codec in ('aac', 'mp4a') else ['-c:a', 'aac', '-b:a', '192k']
 
     cmd = [
@@ -63,18 +138,28 @@ def convert_to_universal_mp4(input_file, output_file):
         '-movflags', '+faststart',
         output_file
     ]
-    print(f"Running ffmpeg remux: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True, timeout=120)
+    subprocess.run(cmd, check=True, timeout=180)
 
 class DownloaderHandler(BaseHTTPRequestHandler):
-    def send_cors_headers(self):
+    def get_client_ip(self) -> str:
+        # Check X-Forwarded-For if behind reverse proxy, else client_address
+        forwarded = self.headers.get('X-Forwarded-For')
+        if forwarded:
+            return forwarded.split(',')[0].strip()
+        return self.client_address[0]
+
+    def send_security_headers(self):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, HEAD')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Accept')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('X-XSS-Protection', '1; mode=block')
+        self.send_header('Referrer-Policy', 'strict-origin-when-cross-origin')
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_cors_headers()
+        self.send_security_headers()
         self.end_headers()
 
     def do_HEAD(self):
@@ -84,43 +169,64 @@ class DownloaderHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+        client_ip = self.get_client_ip()
 
         if path == '/api/health':
             self.send_response(200)
-            self.send_cors_headers()
+            self.send_security_headers()
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({'status': 'ok', 'backend': 'yt-dlp', 'ffmpeg': True}).encode('utf-8'))
+            self.wfile.write(json.dumps({'status': 'ok', 'backend': 'yt-dlp', 'ffmpeg': True, 'security': 'hardened'}).encode('utf-8'))
             return
 
         if path == '/api/info':
-            url = query.get('url', [None])[0]
-            if not url:
-                self.send_error_json(400, 'Parameter "url" diperlukan.')
+            # Rate limiting
+            if not info_limiter.is_allowed(client_ip):
+                self.send_error_json(429, 'Terlalu banyak permintaan (Rate limit). Silakan tunggu sebentar.')
                 return
-            self.handle_info(url)
+
+            raw_url = query.get('url', [None])[0]
+            is_valid, validated_url = validate_and_sanitize_url(raw_url)
+            if not is_valid:
+                self.send_error_json(400, validated_url)
+                return
+
+            self.handle_info(validated_url)
             return
 
         if path == '/api/download':
-            url = query.get('url', [None])[0]
-            format_type = query.get('type', ['video'])[0]  # video or audio
-            quality = query.get('quality', ['best'])[0]     # 2160, 1080, 720, 480, best
-            if not url:
-                self.send_error_json(400, 'Parameter "url" diperlukan.')
+            # Rate limiting
+            if not download_limiter.is_allowed(client_ip):
+                self.send_error_json(429, 'Batas pengunduhan per menit tercapai. Silakan tunggu 1 menit.')
                 return
-            self.handle_download(url, format_type, quality)
+
+            raw_url = query.get('url', [None])[0]
+            is_valid, validated_url = validate_and_sanitize_url(raw_url)
+            if not is_valid:
+                self.send_error_json(400, validated_url)
+                return
+
+            format_type = query.get('type', ['video'])[0]
+            if format_type not in ('video', 'audio'):
+                format_type = 'video'
+
+            raw_quality = query.get('quality', ['best'])[0]
+            # Sanitize quality parameter (only alphanumeric, e.g. '1080', '720', 'best')
+            quality = re.sub(r'[^a-zA-Z0-9]', '', raw_quality)[:10] or 'best'
+
+            self.handle_download(validated_url, format_type, quality)
             return
 
         self.send_error_json(404, 'Endpoint tidak ditemukan.')
 
-    def send_error_json(self, code, message):
+    def send_error_json(self, code: int, message: str):
         self.send_response(code)
-        self.send_cors_headers()
+        self.send_security_headers()
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
         self.wfile.write(json.dumps({'error': message}).encode('utf-8'))
 
-    def handle_info(self, url):
+    def handle_info(self, url: str):
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
@@ -132,6 +238,12 @@ class DownloaderHandler(BaseHTTPRequestHandler):
                 info = ydl.extract_info(url, download=False)
                 if not info:
                     self.send_error_json(400, 'Tidak dapat mengekstrak informasi media.')
+                    return
+
+                # Duration check for DoS defense
+                duration_sec = info.get('duration') or 0
+                if duration_sec > MAX_DURATION_SECONDS:
+                    self.send_error_json(400, f'Durasi video melebihi batas maksimal 4 jam ({duration_sec // 3600} jam).')
                     return
 
                 extractor = info.get('extractor_key', info.get('extractor', 'unknown')).lower()
@@ -158,12 +270,11 @@ class DownloaderHandler(BaseHTTPRequestHandler):
                 title = info.get('title') or 'Video Media'
                 author = info.get('uploader') or info.get('creator') or info.get('channel') or '@creator'
                 thumbnail = info.get('thumbnail') or ''
-                duration_sec = info.get('duration') or 0
+                
                 minutes = int(duration_sec // 60)
                 seconds = int(duration_sec % 60)
                 duration = f"{minutes}:{seconds:02d}" if duration_sec else "HD"
 
-                # Video preview URL: For YouTube, use clean embed
                 video_preview_url = ''
                 if platform == 'youtube' and info.get('id'):
                     video_preview_url = f"https://www.youtube.com/embed/{info.get('id')}?autoplay=1"
@@ -174,9 +285,7 @@ class DownloaderHandler(BaseHTTPRequestHandler):
                 video_options = []
                 audio_options = []
 
-                # Group available heights and prioritize H.264
                 heights_seen = set()
-                # Sort formats so AVC1 (h264) comes first
                 sorted_formats = sorted(
                     raw_formats,
                     key=lambda f: (
@@ -254,115 +363,111 @@ class DownloaderHandler(BaseHTTPRequestHandler):
                 }
 
                 self.send_response(200)
-                self.send_cors_headers()
+                self.send_security_headers()
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.end_headers()
                 self.wfile.write(json.dumps(data).encode('utf-8'))
         except Exception as e:
-            self.send_error_json(500, f"Gagal mengekstrak: {str(e)[:120]}")
+            # Sanitized error message without leaking internal paths
+            clean_err = re.sub(r'([A-Za-z]:\\[^:\n\r]+|\/[a-zA-Z0-9_\-\.\/]+)', '[path]', str(e))
+            self.send_error_json(500, f"Gagal mengekstrak informasi media: {clean_err[:100]}")
 
-    def handle_download(self, url, format_type, quality):
-        pid = os.getpid()
-        target_id = f"dl_{pid}_{abs(hash(url)) % 100000}"
-        raw_output_template = os.path.join(DOWNLOAD_DIR, f"{target_id}_raw.%(ext)s")
-        final_output_file = os.path.join(DOWNLOAD_DIR, f"{target_id}_final.{ 'mp3' if format_type == 'audio' else 'mp4' }")
-        
-        ydl_opts = {
-            'outtmpl': raw_output_template,
-            'quiet': True,
-            'no_warnings': True,
-            'overwrites': True,
-        }
+    def handle_download(self, url: str, format_type: str, quality: str):
+        # Create an isolated temporary directory per job to prevent file collisions or race conditions
+        with tempfile.TemporaryDirectory(prefix="omnidl_") as job_dir:
+            job_uuid = uuid.uuid4().hex
+            raw_output_template = os.path.join(job_dir, f"{job_uuid}_raw.%(ext)s")
+            final_output_file = os.path.join(job_dir, f"{job_uuid}_final.{ 'mp3' if format_type == 'audio' else 'mp4' }")
 
-        if format_type == 'audio':
-            ydl_opts['format'] = 'bestaudio/best'
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '320',
-            }]
-        else:
-            # Video: Prioritize AVC1 (H.264) + M4A (AAC) for instant compatibility!
-            if quality and quality.isdigit():
-                ydl_opts['format'] = (
-                    f"bestvideo[height<={quality}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
-                    f"bestvideo[height<={quality}][vcodec^=avc]+bestaudio[ext=m4a]/"
-                    f"bestvideo[height<={quality}]+bestaudio[ext=m4a]/"
-                    f"bestvideo[height<={quality}]+bestaudio/"
-                    f"best[height<={quality}]/best"
-                )
+            ydl_opts = {
+                'outtmpl': raw_output_template,
+                'quiet': True,
+                'no_warnings': True,
+                'max_filesize': MAX_FILESIZE_BYTES,
+            }
+
+            if format_type == 'audio':
+                ydl_opts['format'] = 'bestaudio/best'
+                ydl_opts['postprocessors'] = [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '320',
+                }]
             else:
-                ydl_opts['format'] = (
-                    "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
-                    "bestvideo[vcodec^=avc]+bestaudio[ext=m4a]/"
-                    "bestvideo+bestaudio[ext=m4a]/"
-                    "bestvideo+bestaudio/best"
-                )
-            ydl_opts['merge_output_format'] = 'mp4'
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                
-                # Identify raw downloaded file
-                matching = [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR) if f.startswith(f"{target_id}_raw")]
-                if not matching:
-                    # Check any file with target_id
-                    matching = [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR) if target_id in f and not f.endswith('.part')]
-                
-                if not matching:
-                    self.send_error_json(500, "File hasil unduhan tidak ditemukan.")
-                    return
-
-                downloaded_file = matching[0]
-
-                # If audio, yt-dlp might have already created .mp3
-                if format_type == 'audio':
-                    base, _ = os.path.splitext(downloaded_file)
-                    if os.path.exists(base + '.mp3'):
-                        file_to_send = base + '.mp3'
-                    else:
-                        file_to_send = downloaded_file
+                if quality and quality.isdigit():
+                    ydl_opts['format'] = (
+                        f"bestvideo[height<={quality}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+                        f"bestvideo[height<={quality}][vcodec^=avc]+bestaudio[ext=m4a]/"
+                        f"bestvideo[height<={quality}]+bestaudio[ext=m4a]/"
+                        f"bestvideo[height<={quality}]+bestaudio/"
+                        f"best[height<={quality}]/best"
+                    )
                 else:
-                    # Video: Run convert_to_universal_mp4 to guarantee H.264 + AAC + faststart!
-                    try:
-                        convert_to_universal_mp4(downloaded_file, final_output_file)
-                        file_to_send = final_output_file
-                    except Exception as conv_err:
-                        print(f"Conversion warning: {conv_err}, sending raw downloaded file")
-                        file_to_send = downloaded_file
+                    ydl_opts['format'] = (
+                        "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+                        "bestvideo[vcodec^=avc]+bestaudio[ext=m4a]/"
+                        "bestvideo+bestaudio[ext=m4a]/"
+                        "bestvideo+bestaudio/best"
+                    )
+                ydl_opts['merge_output_format'] = 'mp4'
 
-                filesize = os.path.getsize(file_to_send)
-                clean_title = "".join(c for c in info.get('title', 'video') if c.isalnum() or c in (' ', '_', '-')).strip()[:40] or 'media'
-                ext = 'mp3' if format_type == 'audio' else 'mp4'
-                download_name = f"{clean_title}.{ext}"
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if not info:
+                        self.send_error_json(400, "Tidak dapat memproses konten media dari tautan ini.")
+                        return
 
-                self.send_response(200)
-                self.send_cors_headers()
-                self.send_header('Content-Type', 'audio/mpeg' if ext == 'mp3' else 'video/mp4')
-                self.send_header('Content-Length', str(filesize))
-                self.send_header('Content-Disposition', f'attachment; filename="{download_name}"')
-                self.end_headers()
+                    # Find downloaded file inside isolated job_dir
+                    job_files = [os.path.join(job_dir, f) for f in os.listdir(job_dir) if not f.endswith('.part')]
+                    if not job_files:
+                        self.send_error_json(500, "File hasil unduhan tidak ditemukan.")
+                        return
 
-                with open(file_to_send, 'rb') as f:
-                    while chunk := f.read(128 * 1024):
-                        self.wfile.write(chunk)
+                    downloaded_file = job_files[0]
 
-                # Cleanup temporary files
-                for f in os.listdir(DOWNLOAD_DIR):
-                    if target_id in f:
+                    if format_type == 'audio':
+                        base, _ = os.path.splitext(downloaded_file)
+                        if os.path.exists(base + '.mp3'):
+                            file_to_send = base + '.mp3'
+                        else:
+                            file_to_send = downloaded_file
+                    else:
                         try:
-                            os.remove(os.path.join(DOWNLOAD_DIR, f))
-                        except Exception:
-                            pass
+                            convert_to_universal_mp4(downloaded_file, final_output_file)
+                            file_to_send = final_output_file
+                        except Exception as conv_err:
+                            print(f"Conversion warning: {conv_err}, sending raw downloaded file")
+                            file_to_send = downloaded_file
 
-        except Exception as e:
-            self.send_error_json(500, f"Gagal mendownload media: {str(e)[:120]}")
+                    filesize = os.path.getsize(file_to_send)
+                    raw_title = info.get('title') or 'media'
+                    clean_name = sanitize_filename(raw_title)
+                    ext = 'mp3' if format_type == 'audio' else 'mp4'
+                    download_filename = f"{clean_name}.{ext}"
+                    encoded_filename = urllib.parse.quote(download_filename)
+
+                    self.send_response(200)
+                    self.send_security_headers()
+                    self.send_header('Content-Type', 'audio/mpeg' if ext == 'mp3' else 'video/mp4')
+                    self.send_header('Content-Length', str(filesize))
+                    # Prevent CRLF and header injection via sanitized & encoded filename
+                    self.send_header('Content-Disposition', f'attachment; filename="{download_filename}"; filename*=UTF-8\'\'{encoded_filename}')
+                    self.end_headers()
+
+                    # Stream file safely in chunks
+                    with open(file_to_send, 'rb') as f:
+                        while chunk := f.read(128 * 1024):
+                            self.wfile.write(chunk)
+
+            except Exception as e:
+                clean_err = re.sub(r'([A-Za-z]:\\[^:\n\r]+|\/[a-zA-Z0-9_\-\.\/]+)', '[path]', str(e))
+                self.send_error_json(500, f"Gagal mengunduh media: {clean_err[:100]}")
 
 def run():
     server_address = ('', PORT)
     httpd = HTTPServer(server_address, DownloaderHandler)
-    print(f"🚀 Downloader Backend Server running on http://localhost:{PORT}")
+    print(f"🔒 Hardened Downloader Backend Server running on http://localhost:{PORT}")
     httpd.serve_forever()
 
 if __name__ == '__main__':
