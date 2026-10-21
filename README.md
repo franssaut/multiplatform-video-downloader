@@ -2,6 +2,8 @@
 
 A modern, high-performance, responsive web application and Progressive Web App (PWA) to download videos and audio from 10+ major social platforms in maximum quality (up to 4K UHD 60fps) with zero watermark and universal H.264/AAC compatibility.
 
+🌐 **Live Website (Vercel)**: [https://downloader-omega-drab.vercel.app](https://downloader-omega-drab.vercel.app)
+
 ![OmniDownloader Banner](public/icons/icon-512.png)
 
 ---
