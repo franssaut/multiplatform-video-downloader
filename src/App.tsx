@@ -11,7 +11,6 @@ import { FaqSection } from './components/FaqSection';
 import { Footer } from './components/Footer';
 import { VideoPreviewModal } from './components/VideoPreviewModal';
 import { SettingsModal } from './components/SettingsModal';
-import { PwaInstallPrompt } from './components/PwaInstallPrompt';
 import { MobileBottomNav } from './components/MobileBottomNav';
 import type { Platform, MediaResult, QualityOption, DownloadHistoryItem } from './types';
 import { detectPlatform, isValidUrl, fetchMediaInfo } from './utils/detector';
@@ -247,9 +246,6 @@ export function App() {
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
       />
-
-      {/* PWA Mobile Floating Install Banner */}
-      <PwaInstallPrompt />
 
       {/* Mobile Bottom Navigation Bar */}
       <MobileBottomNav
