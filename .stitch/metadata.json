@@ -1,0 +1,14 @@
+{
+  "projectId": "7574896327111391189",
+  "title": "Multiplatform Video Downloader Web",
+  "deviceType": "web",
+  "lastSyncTime": "2026-10-21T09:50:00Z",
+  "screens": {
+    "9fdc21ba1919479196ab244f74eb8701": {
+      "id": "9fdc21ba1919479196ab244f74eb8701",
+      "label": "Multiplatform Video Downloader Web",
+      "status": "generated",
+      "canvasPosition": { "x": 0, "y": 0 }
+    }
+  }
+}
