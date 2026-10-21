@@ -1,6 +1,13 @@
 import type { Platform, MediaResult, QualityOption } from '../types';
 
-const BACKEND_URL = 'http://127.0.0.1:5000';
+const isLocalDev =
+  typeof window !== 'undefined' &&
+  (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') &&
+  window.location.port === '5173';
+
+const CLOUD_TUNNEL_URL = 'https://knives-dog-sacred-frame.trycloudflare.com';
+
+export const BACKEND_URL = isLocalDev ? 'http://127.0.0.1:5000' : CLOUD_TUNNEL_URL;
 
 export function detectPlatform(url: string): Platform {
   const trimmed = url.trim().toLowerCase();
@@ -54,9 +61,10 @@ export async function fetchMediaInfo(url: string): Promise<MediaResult> {
   const cleanUrl = url.trim();
   const platform = detectPlatform(cleanUrl);
 
+  // Try 1: Primary BACKEND_URL
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    const timeoutId = setTimeout(() => controller.abort(), 18000);
 
     const resp = await fetch(`${BACKEND_URL}/api/info?url=${encodeURIComponent(cleanUrl)}`, {
       signal: controller.signal,
@@ -68,7 +76,27 @@ export async function fetchMediaInfo(url: string): Promise<MediaResult> {
       return data as MediaResult;
     }
   } catch (err) {
-    console.warn('Backend API not responding or failed, using intelligent fallback:', err);
+    console.warn('Primary backend failed, attempting relative API route:', err);
+  }
+
+  // Try 2: Relative /api/info (routed via Vercel proxy rewrite)
+  if (!isLocalDev) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 18000);
+
+      const resp = await fetch(`/api/info?url=${encodeURIComponent(cleanUrl)}`, {
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (resp.ok) {
+        const data = await resp.json();
+        return data as MediaResult;
+      }
+    } catch (err2) {
+      console.warn('Relative API fallback failed:', err2);
+    }
   }
 
   // Graceful fallback to mock data
@@ -86,21 +114,42 @@ export async function downloadRealMediaFile(
   const quality = format.qualityValue || (format.id.replace('v_', '').replace('a_', ''));
   const downloadUrl = `${BACKEND_URL}/api/download?url=${encodeURIComponent(originalUrl)}&type=${formatType}&quality=${quality}`;
 
-  if (onProgress) onProgress(20);
+  if (onProgress) onProgress(25);
 
+  const cleanTitle = title.replace(/[^a-zA-Z0-9_\-\s]/g, '').trim().slice(0, 35) || 'media';
+  const fileName = `${cleanTitle}.${format.ext}`;
+
+  // Detect mobile devices (Android / iOS)
+  const isMobile =
+    typeof navigator !== 'undefined' &&
+    /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+
+  if (isMobile) {
+    if (onProgress) onProgress(80);
+    // On mobile devices, triggering standard anchor click lets the OS native download manager take over cleanly
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      document.body.removeChild(a);
+      if (onProgress) onProgress(100);
+    }, 1000);
+    return;
+  }
+
+  // Desktop: fetch as blob for progress, fallback to direct browser navigation
   try {
     const response = await fetch(downloadUrl);
     if (!response.ok) {
       throw new Error(`Server returned ${response.status}`);
     }
 
-    if (onProgress) onProgress(60);
+    if (onProgress) onProgress(70);
 
     const blob = await response.blob();
     if (onProgress) onProgress(90);
-
-    const cleanTitle = title.replace(/[^a-zA-Z0-9_\-\s]/g, '').trim().slice(0, 35) || 'media';
-    const fileName = `${cleanTitle}.${format.ext}`;
 
     const blobUrl = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -113,9 +162,9 @@ export async function downloadRealMediaFile(
 
     if (onProgress) onProgress(100);
   } catch (err) {
-    console.error('Direct download stream failed, falling back to direct browser navigation:', err);
-    // Fallback: direct window navigation to let browser handle native download stream
+    console.warn('Blob download failed, falling back to direct browser navigation:', err);
     window.location.href = downloadUrl;
+    if (onProgress) onProgress(100);
   }
 }
 

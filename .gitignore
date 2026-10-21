@@ -36,3 +36,4 @@ __pycache__/
 temp/
 
 .vercel
+cloudflared.exe
