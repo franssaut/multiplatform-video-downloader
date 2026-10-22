@@ -10,6 +10,7 @@ import tempfile
 import threading
 import urllib.parse
 import subprocess
+import requests
 from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -129,6 +130,40 @@ def extract_single_entry(info: dict, url: str) -> dict:
                     return entry
         return entries[0]
     return info
+
+def fetch_tiktok_api(url: str):
+    """
+    Dedicated high-speed TikTok resolver via TikWM API.
+    Bypasses datacenter/cloud IP blocks from TikTok, extracts 100% no-watermark HD video.
+    """
+    try:
+        resolved_url = url
+        if 'vt.tiktok.com' in url or 'vm.tiktok.com' in url:
+            try:
+                head_resp = requests.head(
+                    url,
+                    allow_redirects=True,
+                    timeout=5,
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                )
+                if head_resp.url:
+                    resolved_url = head_resp.url
+            except Exception:
+                pass
+
+        resp = requests.get(
+            'https://www.tikwm.com/api/',
+            params={'url': resolved_url},
+            timeout=10,
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        )
+        if resp.status_code == 200:
+            res = resp.json()
+            if res.get('code') == 0 and 'data' in res:
+                return True, res['data']
+    except Exception as e:
+        print(f"TikWM fetch notice: {e}")
+    return False, None
 
 def get_stream_codecs(file_path: str):
     """Inspect file to find video and audio codec names using ffprobe."""
@@ -260,6 +295,64 @@ class DownloaderHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({'error': message}).encode('utf-8'))
 
     def handle_info(self, url: str):
+        # Dedicated TikTok bypass to prevent datacenter / cloud IP bans
+        if 'tiktok.com' in url.lower():
+            tt_ok, tt_data = fetch_tiktok_api(url)
+            if tt_ok and tt_data:
+                dur_sec = tt_data.get('duration') or 0
+                minutes = int(dur_sec // 60)
+                seconds = int(dur_sec % 60)
+                duration = f"{minutes}:{seconds:02d}" if dur_sec else "HD"
+                title = tt_data.get('title') or 'TikTok Video (Tanpa Watermark)'
+                author = (tt_data.get('author') or {}).get('nickname') or (tt_data.get('author') or {}).get('unique_id') or '@creator'
+                data = {
+                    'id': str(tt_data.get('id', 'tiktok')),
+                    'originalUrl': url,
+                    'title': title,
+                    'author': author,
+                    'authorAvatar': 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80',
+                    'thumbnailUrl': tt_data.get('cover') or '',
+                    'videoPreviewUrl': tt_data.get('play') or '',
+                    'duration': duration,
+                    'views': f"{tt_data.get('play_count', 0):,} tayangan" if tt_data.get('play_count') else "HD Original",
+                    'platform': 'tiktok',
+                    'formats': {
+                        'videos': [
+                            {
+                                'id': 'v_best',
+                                'label': 'Full HD (Tanpa Watermark)',
+                                'resolution': 'Original HD',
+                                'ext': 'mp4',
+                                'size': 'Direct CDN',
+                                'qualityNote': '100% No Watermark Super Fast',
+                                'hasAudio': True,
+                                'isRecommended': True,
+                                'qualityValue': 'best'
+                            }
+                        ],
+                        'audios': [
+                            {
+                                'id': 'a_320',
+                                'label': 'Original Audio Sound',
+                                'bitrate': '320 kbps',
+                                'ext': 'mp3',
+                                'size': 'Audio File',
+                                'qualityNote': 'Audio Jernih MP3',
+                                'hasAudio': True,
+                                'isRecommended': True,
+                                'qualityValue': 'best'
+                            }
+                        ],
+                        'subtitles': []
+                    }
+                }
+                self.send_response(200)
+                self.send_security_headers()
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps(data).encode('utf-8'))
+                return
+
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
@@ -419,6 +512,38 @@ class DownloaderHandler(BaseHTTPRequestHandler):
             self.send_error_json(500, f"Gagal mengekstrak informasi media: {clean_err[:100]}")
 
     def handle_download(self, url: str, format_type: str, quality: str):
+        # Fast direct TikTok streaming (bypasses datacenter block & saves server CPU)
+        if 'tiktok.com' in url.lower():
+            try:
+                tt_ok, tt_data = fetch_tiktok_api(url)
+                if tt_ok and tt_data:
+                    target_cdn = tt_data.get('music') if format_type == 'audio' else (tt_data.get('hdplay') or tt_data.get('play'))
+                    if target_cdn:
+                        r = requests.get(target_cdn, stream=True, timeout=60, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+                        if r.status_code == 200:
+                            raw_title = tt_data.get('title') or 'TikTok_Video'
+                            clean_name = sanitize_filename(raw_title)
+                            ext = 'mp3' if format_type == 'audio' else 'mp4'
+                            download_filename = f"{clean_name}.{ext}"
+                            encoded_filename = urllib.parse.quote(download_filename)
+                            content_type = 'audio/mpeg' if ext == 'mp3' else 'video/mp4'
+                            content_len = r.headers.get('Content-Length')
+
+                            self.send_response(200)
+                            self.send_security_headers()
+                            self.send_header('Content-Type', content_type)
+                            if content_len:
+                                self.send_header('Content-Length', content_len)
+                            self.send_header('Content-Disposition', f'attachment; filename="{download_filename}"; filename*=UTF-8\'\'{encoded_filename}')
+                            self.end_headers()
+
+                            for chunk in r.iter_content(chunk_size=128 * 1024):
+                                if chunk:
+                                    self.wfile.write(chunk)
+                            return
+            except Exception as tt_dl_err:
+                print(f"Server TikWM streaming notice: {tt_dl_err}")
+
         # Create an isolated temporary directory per job to prevent file collisions or race conditions
         with tempfile.TemporaryDirectory(prefix="omnidl_") as job_dir:
             job_uuid = uuid.uuid4().hex

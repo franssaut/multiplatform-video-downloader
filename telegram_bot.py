@@ -51,8 +51,65 @@ def extract_urls(text: str):
     url_pattern = r'https?://[^\s<>"]+'
     return re.findall(url_pattern, text)
 
+def fetch_tiktok_api(url: str):
+    """
+    Dedicated high-speed TikTok resolver via TikWM API.
+    Bypasses datacenter/cloud IP blocks from TikTok, extracts 100% no-watermark HD video.
+    """
+    try:
+        resolved_url = url
+        if 'vt.tiktok.com' in url or 'vm.tiktok.com' in url:
+            try:
+                head_resp = requests.head(
+                    url,
+                    allow_redirects=True,
+                    timeout=5,
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                )
+                if head_resp.url:
+                    resolved_url = head_resp.url
+            except Exception:
+                pass
+
+        resp = requests.get(
+            'https://www.tikwm.com/api/',
+            params={'url': resolved_url},
+            timeout=10,
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        )
+        if resp.status_code == 200:
+            res = resp.json()
+            if res.get('code') == 0 and 'data' in res:
+                d = res['data']
+                dur_sec = d.get('duration') or 0
+                minutes = int(dur_sec // 60)
+                seconds = int(dur_sec % 60)
+                duration = f"{minutes}:{seconds:02d}" if dur_sec else "HD"
+
+                return True, {
+                    'id': str(d.get('id', 'tiktok')),
+                    'originalUrl': resolved_url,
+                    'title': d.get('title') or 'TikTok Video (Tanpa Watermark)',
+                    'author': (d.get('author') or {}).get('nickname') or (d.get('author') or {}).get('unique_id') or '@creator',
+                    'thumbnailUrl': d.get('cover') or '',
+                    'duration': duration,
+                    'platform': 'TikTok (No Watermark)',
+                    'isImage': False,
+                    'tiktok_video_url': d.get('hdplay') or d.get('play'),
+                    'tiktok_music_url': d.get('music')
+                }
+    except Exception as e:
+        print(f"TikWM fetch error: {e}")
+    return False, None
+
 def get_media_info(url: str):
-    """Fetch media info either from backend server or direct yt_dlp fallback."""
+    """Fetch media info either from TikWM (for TikTok), backend server, or direct yt_dlp fallback."""
+    # Special bypass for TikTok to avoid Datacenter/VPS IP blocks
+    if 'tiktok.com' in url.lower():
+        tt_success, tt_data = fetch_tiktok_api(url)
+        if tt_success and tt_data:
+            return True, tt_data
+
     if BACKEND_URL:
         try:
             resp = requests.get(f"{BACKEND_URL}/api/info", params={"url": url}, timeout=5)
@@ -193,6 +250,32 @@ def download_media_file(url: str, format_type: str = "video"):
     job_uuid = uuid.uuid4().hex
     raw_template = os.path.join(temp_dir, f"{job_uuid}_raw.%(ext)s")
     final_output = os.path.join(temp_dir, f"{job_uuid}_final.{ 'mp3' if format_type == 'audio' else 'mp4' }")
+
+    # Fast direct CDN download for TikTok (bypasses datacenter IP blocks)
+    if 'tiktok.com' in url.lower():
+        try:
+            tt_ok, tt_data = fetch_tiktok_api(url)
+            if tt_ok and tt_data:
+                target_cdn_url = tt_data.get('tiktok_music_url') if format_type == 'audio' else tt_data.get('tiktok_video_url')
+                if target_cdn_url:
+                    ext = 'mp3' if format_type == 'audio' else 'mp4'
+                    raw_title = tt_data.get('title') or 'TikTok_Video'
+                    clean_title = server.sanitize_filename(raw_title)
+                    target_file = os.path.join(temp_dir, f"{job_uuid}.{ext}")
+                    r = requests.get(
+                        target_cdn_url,
+                        stream=True,
+                        timeout=60,
+                        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                    )
+                    if r.status_code == 200:
+                        with open(target_file, 'wb') as f:
+                            for chunk in r.iter_content(chunk_size=128 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+                        return True, target_file, f"{clean_title}.{ext}", temp_dir
+        except Exception as tt_err:
+            print(f"TikWM direct download notice: {tt_err}, falling back to yt-dlp")
 
     ydl_opts = {
         'outtmpl': raw_template,
