@@ -97,6 +97,39 @@ def sanitize_filename(name: str, fallback: str = "media", max_len: int = 50) -> 
     clean = re.sub(r'\s+', '_', clean)
     return clean[:max_len] if clean else fallback
 
+def get_cookie_file():
+    """Find available Netscape cookies.txt file for authenticated platforms like Instagram Stories."""
+    env_cookie = os.getenv("COOKIES_FILE")
+    if env_cookie and os.path.exists(env_cookie):
+        return env_cookie
+    local_cookie = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+    if os.path.exists(local_cookie):
+        return local_cookie
+    local_ig_cookie = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instagram_cookies.txt")
+    if os.path.exists(local_ig_cookie):
+        return local_ig_cookie
+    return None
+
+def extract_single_entry(info: dict, url: str) -> dict:
+    """
+    Unpack single media item from playlist or multi-entry containers like Instagram Stories.
+    Matches specific story ID from the URL if present.
+    """
+    if not info:
+        return {}
+    if info.get('_type') == 'playlist' or 'entries' in info:
+        entries = [e for e in info.get('entries', []) if e]
+        if not entries:
+            return info
+        m = re.search(r'/stories/[^/]+/(\d+)', url)
+        if m:
+            target_id = m.group(1)
+            for entry in entries:
+                if str(entry.get('id')) == target_id:
+                    return entry
+        return entries[0]
+    return info
+
 def get_stream_codecs(file_path: str):
     """Inspect file to find video and audio codec names using ffprobe."""
     try:
@@ -233,11 +266,21 @@ class DownloaderHandler(BaseHTTPRequestHandler):
             'skip_download': True,
             'extract_flat': False,
         }
+        cookie_path = get_cookie_file()
+        if cookie_path:
+            ydl_opts['cookiefile'] = cookie_path
+
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if not info:
+                raw_info = ydl.extract_info(url, download=False)
+                if not raw_info:
                     self.send_error_json(400, 'Tidak dapat mengekstrak informasi media.')
+                    return
+
+                # Unpack playlist / multi-story container (Instagram Stories / Highlights)
+                info = extract_single_entry(raw_info, url)
+                if not info:
+                    self.send_error_json(400, 'Tidak ada konten media yang dapat diunduh.')
                     return
 
                 # Duration check for DoS defense
@@ -267,7 +310,7 @@ class DownloaderHandler(BaseHTTPRequestHandler):
                 elif 'soundcloud' in extractor:
                     platform = 'soundcloud'
 
-                title = info.get('title') or 'Video Media'
+                title = info.get('title') or ('Instagram Story' if 'instagram' in platform else 'Video Media')
                 author = info.get('uploader') or info.get('creator') or info.get('channel') or '@creator'
                 thumbnail = info.get('thumbnail') or ''
                 
@@ -368,8 +411,11 @@ class DownloaderHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps(data).encode('utf-8'))
         except Exception as e:
-            # Sanitized error message without leaking internal paths
-            clean_err = re.sub(r'([A-Za-z]:\\[^:\n\r]+|\/[a-zA-Z0-9_\-\.\/]+)', '[path]', str(e))
+            raw_err = str(e)
+            if 'log in to access this content' in raw_err.lower() or 'cookies' in raw_err.lower():
+                self.send_error_json(401, "Instagram Stories memerlukan autentikasi login Instagram. Silakan sediakan file cookies.txt pada folder aplikasi.")
+                return
+            clean_err = re.sub(r'([A-Za-z]:\\[^:\n\r]+|\/[a-zA-Z0-9_\-\.\/]+)', '[path]', raw_err)
             self.send_error_json(500, f"Gagal mengekstrak informasi media: {clean_err[:100]}")
 
     def handle_download(self, url: str, format_type: str, quality: str):
@@ -385,6 +431,10 @@ class DownloaderHandler(BaseHTTPRequestHandler):
                 'no_warnings': True,
                 'max_filesize': MAX_FILESIZE_BYTES,
             }
+
+            cookie_path = get_cookie_file()
+            if cookie_path:
+                ydl_opts['cookiefile'] = cookie_path
 
             if format_type == 'audio':
                 ydl_opts['format'] = 'bestaudio/best'
@@ -418,6 +468,9 @@ class DownloaderHandler(BaseHTTPRequestHandler):
                         self.send_error_json(400, "Tidak dapat memproses konten media dari tautan ini.")
                         return
 
+                    # Unpack if playlist or multiple entries
+                    info = extract_single_entry(info, url)
+
                     # Find downloaded file inside isolated job_dir
                     job_files = [os.path.join(job_dir, f) for f in os.listdir(job_dir) if not f.endswith('.part')]
                     if not job_files:
@@ -425,13 +478,21 @@ class DownloaderHandler(BaseHTTPRequestHandler):
                         return
 
                     downloaded_file = job_files[0]
+                    is_image = downloaded_file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
 
-                    if format_type == 'audio':
+                    if is_image:
+                        file_to_send = downloaded_file
+                        img_ext = os.path.splitext(downloaded_file)[1].lstrip('.').lower()
+                        content_type = 'image/jpeg' if img_ext in ('jpg', 'jpeg') else f'image/{img_ext}'
+                        ext = img_ext
+                    elif format_type == 'audio':
                         base, _ = os.path.splitext(downloaded_file)
                         if os.path.exists(base + '.mp3'):
                             file_to_send = base + '.mp3'
                         else:
                             file_to_send = downloaded_file
+                        content_type = 'audio/mpeg'
+                        ext = 'mp3'
                     else:
                         try:
                             convert_to_universal_mp4(downloaded_file, final_output_file)
@@ -439,17 +500,18 @@ class DownloaderHandler(BaseHTTPRequestHandler):
                         except Exception as conv_err:
                             print(f"Conversion warning: {conv_err}, sending raw downloaded file")
                             file_to_send = downloaded_file
+                        content_type = 'video/mp4'
+                        ext = 'mp4'
 
                     filesize = os.path.getsize(file_to_send)
-                    raw_title = info.get('title') or 'media'
+                    raw_title = info.get('title') or ('Instagram_Story' if 'instagram' in url.lower() else 'media')
                     clean_name = sanitize_filename(raw_title)
-                    ext = 'mp3' if format_type == 'audio' else 'mp4'
                     download_filename = f"{clean_name}.{ext}"
                     encoded_filename = urllib.parse.quote(download_filename)
 
                     self.send_response(200)
                     self.send_security_headers()
-                    self.send_header('Content-Type', 'audio/mpeg' if ext == 'mp3' else 'video/mp4')
+                    self.send_header('Content-Type', content_type)
                     self.send_header('Content-Length', str(filesize))
                     # Prevent CRLF and header injection via sanitized & encoded filename
                     self.send_header('Content-Disposition', f'attachment; filename="{download_filename}"; filename*=UTF-8\'\'{encoded_filename}')

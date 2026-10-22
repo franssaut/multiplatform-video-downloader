@@ -76,6 +76,23 @@ npm run dev
 # Running on http://localhost:5173
 ```
 
+### 4. Run the Telegram Bot Downloader (Optional)
+
+You can also run the built-in Telegram Bot so users can download videos/audio directly from Telegram:
+
+1. Copy `.env.example` to `.env`:
+   ```bash
+   cp .env.example .env
+   ```
+2. Get your Bot Token from [@BotFather](https://t.me/BotFather) on Telegram and put it into `.env`:
+   ```env
+   TELEGRAM_BOT_TOKEN=your_token_from_botfather
+   ```
+3. Run the bot:
+   ```bash
+   python telegram_bot.py
+   ```
+
 ---
 
 ## 📄 License

@@ -1,3 +1,9 @@
+# Environment variables & Cookies
+.env
+.env.local
+cookies.txt
+instagram_cookies.txt
+
 # Logs
 logs
 *.log
